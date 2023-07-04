@@ -63,6 +63,41 @@ scale_t_bits scale_t_to_scale_t_bits(scale_t x) {
   un.f = x;
   return un.b;
 }
+
+void gemminiMvinOffset(const Value &mem, const size_t offset, const uint32_t SpAddr,
+                       const size_t cols, const size_t rows,
+                       ConversionPatternRewriter &rewriter) {
+  Location loc = mem.getLoc();
+  Value offsetOp = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI64IntegerAttr(offset));
+  IntegerType i64Type = rewriter.getI64Type();
+  Value configPtr = rewriter.create<arith::AddIOp>(loc, i64Type, mem, offsetOp);
+  Value spadAddrValue = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI64IntegerAttr(SpAddr));
+  uint64_t spadAddrInt = (uint64_t)rows << (ADDR_LEN + 16) |
+                         (uint64_t)cols << ADDR_LEN | (uint64_t) SpAddr;
+  Value spad = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI64IntegerAttr(spadAddrInt));
+  rewriter.create<Mvin_IntrOp>(loc, configPtr, spad);
+}
+
+void gemminiMvoutOffset(const Value &mem, const size_t offset, const uint32_t SpAddr,
+                        const size_t cols, const size_t rows,
+                        ConversionPatternRewriter &rewriter) {
+  Location loc = mem.getLoc();
+  Value offsetOp = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI64IntegerAttr(offset));
+  IntegerType i64Type = rewriter.getI64Type();
+  Value configPtr = rewriter.create<arith::AddIOp>(loc, i64Type, mem, offsetOp);
+  Value spadAddrValue = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI64IntegerAttr(SpAddr));
+  uint64_t spadAddrInt = (uint64_t)rows << (ADDR_LEN + 16) |
+                         (uint64_t)cols << ADDR_LEN | (uint64_t) SpAddr;
+  Value spad = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI64IntegerAttr(spadAddrInt));
+  rewriter.create<Mvout_IntrOp>(loc, configPtr, spad);
+}
+
 }; // namespace
 
 template <typename OpTy>
@@ -578,39 +613,7 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
     }
   }
 
-  void gemminiMvinOffset(const Value &mem, const size_t offset, const uint32_t SpAddr,
-           const size_t cols, const size_t rows,
-           ConversionPatternRewriter &rewriter) const{
-    Location loc = mem.getLoc();
-    Value offsetOp = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(offset));
-    IntegerType i64Type = rewriter.getI64Type();
-    Value configPtr = rewriter.create<arith::AddIOp>(loc, i64Type, mem, offsetOp);
-    Value spadAddrValue = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(SpAddr));
-    uint64_t spadAddrInt = (uint64_t)rows << (ADDR_LEN + 16) |
-                           (uint64_t)cols << ADDR_LEN | (uint64_t) SpAddr;
-    Value spad = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(spadAddrInt));
-    rewriter.create<Mvin_IntrOp>(loc, configPtr, spad);
-  }
 
-  void gemminiMvoutOffset(const Value &mem, const size_t offset, const uint32_t SpAddr,
-                         const size_t cols, const size_t rows,
-                         ConversionPatternRewriter &rewriter) const{
-    Location loc = mem.getLoc();
-    Value offsetOp = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(offset));
-    IntegerType i64Type = rewriter.getI64Type();
-    Value configPtr = rewriter.create<arith::AddIOp>(loc, i64Type, mem, offsetOp);
-    Value spadAddrValue = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(SpAddr));
-    uint64_t spadAddrInt = (uint64_t)rows << (ADDR_LEN + 16) |
-                           (uint64_t)cols << ADDR_LEN | (uint64_t) SpAddr;
-    Value spad = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(spadAddrInt));
-    rewriter.create<Mvout_IntrOp>(loc, configPtr, spad);
-  }
 
   void inner(Value &a, Value &b, Value &pre, Value &out, scale_t aScaleFactor, scale_t bScaleFactor, scale_acc_t dScaleFactor, size_t i, size_t j,
              size_t k, size_t padI, size_t padJ, size_t padK, size_t strideA,
@@ -1017,6 +1020,8 @@ class GemminiTileConvOpLowering : public ConvertOpToLLVMPattern<TileConvOp> {
                    bool noPool, bool downsample, bool inputDilated, bool dw,
                    TileConvOp &tileConvOp,
                    ConversionPatternRewriter &rewriter) const {
+    Location loc = tileConvOp.getLoc();
+
     if (dw) {
       kchs = 1;
       pochs = 1;
@@ -1024,7 +1029,28 @@ class GemminiTileConvOpLowering : public ConvertOpToLLVMPattern<TileConvOp> {
 
     const int orows = porows * poolStride + poolSize - 1 - pupad - pdpad;
     const int ocols = pocols * poolStride + poolSize - 1 - plpad - prpad;
+    const int ochs = pochs;
+
+    // Calculate image dimensions
+    // Note: "irows" and "icols" includes padding
+    const int dilated_krows = krows + (kernelDilation - 1)*(krows - 1);
+    const int dilated_kcols = kcols + (kernelDilation - 1)*(kcols - 1);
+    int irows = orows * stride + dilated_krows - 1;
+    int icols = ocols * stride + dilated_kcols - 1;
+    int irows_unpadded = irows - upad - dpad;
+    int icols_unpadded = icols - lpad - rpad;
     const int ichs = kchs;
+
+#define UNDILATED(x) ((inputDilated) ? (((x)+1)/2) : (x))
+
+    if (inputDilated) {
+      irows_unpadded = (irows_unpadded+1)/2;
+      icols_unpadded = (icols_unpadded+1)/2;
+
+      irows = irows_unpadded + UNDILATED(upad) + UNDILATED(dpad);
+      icols = icols_unpadded + UNDILATED(lpad) + UNDILATED(rpad);
+    }
+
 
 #ifdef HAS_FIRST_LAYER_OPTIMIZATIONS
     const bool transposed =
@@ -1038,6 +1064,30 @@ class GemminiTileConvOpLowering : public ConvertOpToLLVMPattern<TileConvOp> {
 #else
     const int maxPixelsPerRow = 1;
 #endif
+
+    // Calculate spad address offsets
+    const int out_channels_per_bank = ochs / DIM + (ochs % DIM != 0);
+    const int in_channels_per_bank = kchs / DIM + (kchs % DIM != 0);
+    const int bRows = transWeight0132 ?
+                                         in_channels_per_bank * kcols * krows * ochs :
+                                         out_channels_per_bank * kcols * krows * kchs;
+
+    static uint32_t dSpAddrRow = 0;
+    static uint32_t cSpAddrRow = 0;
+
+    const uint32_t A_sp_addr_start = 0;
+    const uint32_t B_sp_addr_start = BANK_NUM * BANK_ROWS - bRows;
+    const uint32_t D_sp_addr_start = (1 << (ADDR_LEN - 1)) + dSpAddrRow;
+    const uint32_t C_sp_addr_start = (3 << (ADDR_LEN - 2)) + cSpAddrRow;
+
+    if (bias != 0) {
+      dSpAddrRow = (dSpAddrRow + ACC_ROWS / 2) % ACC_ROWS;
+    }
+
+    if (output != 0) {
+      cSpAddrRow = (cSpAddrRow + ACC_ROWS / 2) % ACC_ROWS;
+    }
+
     gemminiLoopConvWs(
         batchSize, inDim, inChannels, outChannels, outDim, poolOutDim, stride,
         padding, kernelDim, kernelDilation, poolSize, poolStride, poolPadding,
@@ -1046,6 +1096,335 @@ class GemminiTileConvOpLowering : public ConvertOpToLLVMPattern<TileConvOp> {
         input, noBias, noPool, downsample, wrot180, inputDilated, act,
         transOutput1203, transWeight1203, transWeight0132, transInput3120,
         maxPixelsPerRow, dw, tileConvOp, rewriter);
+/*
+    if (!noPool) {
+        // TODO: Exit, but now I don't known how to do
+//      printf("Pooling with rectangular convolutions is currently not supported.\n");
+//      exit(1);
+    }
+
+    // Only rectangular convolutions will use the following C code
+    // mvin bias
+    if (bias != NULL) {
+      // TODO we probably don't need quite this many nested loops for this part
+
+      const int maxOchsPerMvin = ochs < MAX_BLOCK_LEN_ACC * DIM ? ochs :
+                                                                   MAX_BLOCK_LEN_ACC * DIM;
+      Value zeroValue = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64IntegerAttr(0));
+//      rewriter.create<ConfigLdOp>(loc, zeroValue, llvm::APFloat(MVIN_SCALE_IDENTITY), false, )
+      // TODO: configLd op 这里不够用，需要加block_mvin_stride和pixel_repeats，应该不难
+      gemmini_extended4_config_ld(0, MVIN_SCALE_IDENTITY, false, batches * orows * ocols, 2);
+
+      for (int b = 0; b < batches; b++)
+        for (int orow = 0; orow < orows; orow++)
+          for (int ocol = 0; ocol < ocols; ocol += DIM) {
+            const int I = ocols - ocol > DIM ? DIM : ocols - ocol;
+
+            for (int och = 0; och < ochs; och += maxOchsPerMvin) {
+              const int J = ochs - och > maxOchsPerMvin ? maxOchsPerMvin : ochs - och;
+
+              const uint32_t D_sp_addr = D_sp_addr_start + (och / DIM) * batches * orows * ocols + b * orows * ocols + orow * ocols + ocol;
+
+              const acc_t * bias_dram_addr = noBias ? NULL : bias + och;
+
+              gemmini_extended_mvin3(bias_dram_addr,
+                                     D_sp_addr,
+                                     J, I);
+            }
+          }
+    }
+
+    // mvin input
+    if (input != NULL){
+      int max_chs_per_mvin = ichs < MAX_BLOCK_LEN * DIM ? ichs :
+                                                        MAX_BLOCK_LEN * DIM;
+      if (transInput3120) {
+        max_chs_per_mvin = batches < MAX_BLOCK_LEN * DIM ? batches :
+                                                         MAX_BLOCK_LEN * DIM;
+      }
+
+      const int dramStride = transInput3120 ?
+                                               batchSize * sizeof(elem_t) :
+                                               inChannels * sizeof(elem_t);
+
+      const int spad_stride = transInput3120 ?
+                                               ichs * (irows >> downsample) * (icols >> downsample) :
+                                               batches * (irows >> downsample) * (icols >> downsample);
+
+      gemmini_extended5_config_ld(dramStride << downsample, MVIN_SCALE_IDENTITY, false, spad_stride, maxPixelsPerRow, 0);
+
+      const int b_it = transInput3120 ? max_chs_per_mvin : 1;
+      const int ich_it = transInput3120 ? 1 : max_chs_per_mvin;
+
+      for (int b = 0; b < batches; b += b_it)
+        for (int irow = -UNDILATED(upad); irow < irows_unpadded + UNDILATED(dpad); irow += 1 + downsample) {
+          const int irowPadded = irow + UNDILATED(upad);
+
+          for (int icol = -UNDILATED(lpad); icol < icols_unpadded + UNDILATED(rpad);) {
+            // TODO There might be some unnecessary mvins here at the edge of the image
+
+            int I = icols_unpadded - icol > (DIM << downsample) ?
+                                                                (DIM << downsample) : icols_unpadded - icol;
+
+            if (icol < 0) {
+              I = -icol > DIM ? DIM : -icol;
+            } else if (icol >= icols_unpadded) {
+              I = icols_unpadded + UNDILATED(rpad) - icol > DIM ? DIM : icols_unpadded + UNDILATED(rpad) - icol;
+            }
+
+            const int icol_padded = icol + UNDILATED(lpad);
+
+            for (int ich = 0; ich < ichs; ich += ich_it) {
+              int K = ichs - ich > max_chs_per_mvin ?
+                                                    max_chs_per_mvin : ichs - ich;
+              if (transInput3120) {
+                K = batches - b > max_chs_per_mvin ?
+                                                   max_chs_per_mvin : batches - b;
+              }
+
+#define DS(x) ((x) >> (downsample))
+
+              uint32_t A_sp_addr = A_sp_addr_start + (ich / DIM) * batches * DS(irows) * DS(icols) + b * DS(irows) * DS(icols) + DS(irowPadded) * DS(icols) + DS(icol_padded);
+              if (transInput3120) {
+                A_sp_addr = A_sp_addr_start + (b / DIM) * ichs * DS(irows) * DS(icols) + ich * DS(irows) * DS(icols) + DS(irowPadded) * DS(icols) + DS(icol_padded);
+              }
+
+              const bool is_zeros = irow < 0 || irow >= irows_unpadded || icol < 0 || icol >= icols_unpadded;
+
+              const elem_t * in = input + (b*in_row_dim*in_col_dim + irow*in_col_dim + icol) * in_stride + ich;
+              if (is_zeros) {
+                in = NULL;
+              } else if (transInput3120) {
+                in = input + (ich*in_row_dim*in_col_dim + irow*in_col_dim + icol) * batch_size + b;
+              }
+
+              gemmini_extended_mvin(in,
+                                    A_sp_addr,
+                                    K, I >> downsample);
+            }
+
+            icol += I;
+          }
+        }
+    }
+
+    // mvin weights
+    if (weights != NULL) {
+      int max_chs_per_mvin = ochs < MAX_BLOCK_LEN * DIM ? ochs :
+                                                        MAX_BLOCK_LEN * DIM;
+      if (transWeight0132) {
+        max_chs_per_mvin = kchs < MAX_BLOCK_LEN * DIM ? kchs :
+                                                      MAX_BLOCK_LEN * DIM;
+      }
+
+      size_t dram_stride = weight_stride * sizeof(elem_t);
+      if (dw) {
+        dram_stride = sizeof(elem_t);
+      } else if (transWeight1203) {
+        dram_stride = kernel_dim * kernel_dim * out_channels * sizeof(elem_t);
+      } else if (transWeight0132) {
+        dram_stride = in_channels * sizeof(elem_t);
+      }
+
+      const size_t spad_block_stride = transWeight0132 ?
+                                                         krows * kcols * ochs : krows * kcols * kchs;
+
+      gemmini_extended4_config_ld(dram_stride, MVIN_SCALE_IDENTITY, false, spad_block_stride, 1);
+
+      const size_t och_it = transWeight0132 ? DIM : max_chs_per_mvin;
+      const size_t kch_it = transWeight0132 ? max_chs_per_mvin : DIM;
+
+      for (int och = 0; och < ochs; och += och_it) {
+        for (int krow = 0; krow < krows; krow++)
+          for (int kcol = 0; kcol < kcols; kcol++)
+            for (int kch = 0; kch < kchs; kch += kch_it) {
+              int K = kchs - kch > DIM ? DIM : kchs - kch;
+              int J = ochs - och > max_chs_per_mvin ? max_chs_per_mvin : ochs - och;
+              if (transWeight0132) {
+                K = ochs - och > DIM ? DIM : ochs - och;
+                J = kchs - kch > max_chs_per_mvin ? max_chs_per_mvin : kchs - kch;
+              }
+
+              uint32_t B_sp_addr = B_sp_addr_start + (och / DIM) * krows * kcols * kchs + krow * kcols * kchs + kcol * kchs + kch;
+              if (transWeight0132) {
+                B_sp_addr = B_sp_addr_start + (kch / DIM) * krows * kcols * ochs + krow * kcols * ochs + kcol * ochs + och;
+              }
+
+              const elem_t * w = weights + (krow*kernel_dim*in_channels + kcol*in_channels + kch) * weight_stride + och;
+              if (dw) {
+                w = weights + krow * kernel_dim + kcol;
+              } else if (trans_weight_1203) {
+                w = weights + (kch * kernel_dim * kernel_dim + krow * kernel_dim + kcol) * out_channels + och;
+              } else if (transWeight0132) {
+                w = weights + (krow * kernel_dim * out_channels + kcol * out_channels + och) * in_channels + kch;
+              }
+
+              gemmini_extended_mvin2(w, B_sp_addr, J, K);
+            }
+      }
+    }
+
+    // Compute
+    {
+      const int b_it = transInput3120 ? DIM : 1;
+      const int ocol_it = transInput3120 ? 1 : (DIM << inputDilated);
+
+      if (transInput3120) {
+        gemmini_extended3_config_ex(0, 0, 0, 0, orows * ocols, irows * icols, 0,
+                                    0, true);
+      }
+
+      for (int och = 0; och < ochs; och += DIM) {
+        for (int krow = 0; krow < krows; krow++) {
+          for (int kcol = 0; kcol < kcols; kcol += max_pixels_per_row) {
+            for (int kch = 0; kch < kchs; kch += DIM) {
+              bool new_weights = true;
+
+              for (int b = 0; b < batches; b += b_it) {
+                for (int orow = 0; orow < orows; orow++) {
+                  // Skip some kernel rows due to input-dilation
+                  if (inputDilated &&
+                      ((krow * kernelDilation + orow * stride - upad) % 2 !=
+                       0)) {
+                    continue;
+                  }
+
+                  for (int ocol = 0; ocol < ocols;) {
+                    // Skip some cols dimensions due to input-dilation
+                    if (inputDilated &&
+                        ((kcol + ocol * stride - lpad) % 2 != 0)) {
+                      ocol++;
+                      continue;
+                    }
+
+                    int irow = orow * stride + krow * kernelDilation;
+                    int icol = ocol * stride + kcol * kernelDilation;
+
+                    if (inputDilated) {
+                      irow = (irow + 1) / 2;
+                      icol = (icol + 1) / 2;
+                    }
+
+                    const int pixels = kcols - kcol > max_pixels_per_row
+                                           ? max_pixels_per_row
+                                           : kcols - kcol;
+
+                    const uint32_t C_sp_addr =
+                        C_sp_addr_start +
+                        (och / DIM) * batches * orows * ocols +
+                        b * orows * ocols + orow * ocols + ocol;
+
+                    // Over here, construct a new matrix
+                    //
+                    // Let us assume that we only ever operate on
+                    // one pixel in one row.
+                    // Thus, krows == kcols == 1
+                    //
+                    // Then, for every set of I, J, and K values
+                    //     - I = ocols
+                    //     - J = ochs
+                    //     - K = kchs
+
+                    int I = UNDILATED(ocols - ocol > (DIM << inputDilated)
+                                          ? (DIM << inputDilated)
+                                          : ocols - ocol);
+                    const int J = ochs - och > DIM ? DIM : ochs - och;
+                    const int K =
+                        pixels * (kchs - kch > DIM ? DIM : kchs - kch);
+
+                    if (transInput3120) {
+                      I = batches - b > DIM ? DIM : batches - b;
+                    }
+
+                    uint32_t A_sp_addr =
+                        A_sp_addr_start +
+                        (kch / DIM) * batches * DS(irows) * DS(icols) +
+                        b * DS(irows) * DS(icols) + DS(irow) * DS(icols) +
+                        DS(icol);
+                    if (transInput3120) {
+                      A_sp_addr = A_sp_addr_start +
+                                  (b / DIM) * kchs * DS(irows) * DS(icols) +
+                                  kch * DS(irows) * DS(icols) +
+                                  DS(irow) * DS(icols) + DS(icol);
+                    }
+
+                    const int krow_ = wrot180 ? krows - krow - 1 : krow;
+                    const int kcol_ = wrot180 ? kcols - kcol - 1 : kcol;
+
+                    uint32_t B_sp_addr =
+                        B_sp_addr_start + (och / DIM) * krows * kcols * kchs +
+                        krow_ * kcols * kchs + kcol_ * kchs + kch;
+                    if (transWeight0132) {
+                      B_sp_addr = B_sp_addr_start +
+                                  (kch / DIM) * krows * kcols * ochs +
+                                  krow_ * kcols * ochs + kcol_ * ochs + och;
+                    }
+
+                    const uint32_t pre_sp_addr =
+                        new_weights ? B_sp_addr : GARBAGE_ADDR;
+
+                    // perform matmul
+                    gemmini_extended_preload(pre_sp_addr, C_sp_addr, J, K, J,
+                                             I);
+
+                    if (new_weights) {
+                      gemmini_extended_compute_preloaded(
+                          A_sp_addr, GARBAGE_ADDR, K, I, J, I);
+                    } else {
+                      gemmini_extended_compute_accumulated(
+                          A_sp_addr, GARBAGE_ADDR, K, I, J, I);
+                    }
+
+                    ocol += ocol_it;
+                    new_weights = false;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+#undef DS
+#undef UNDILATED
+
+    // mvout output
+    if (output != NULL) {
+      if (noPool) {
+        for (int b = 0; b < batches; b++)
+          for (int orow = 0; orow < orows; orow++)
+            for (int ocol = 0; ocol < ocols; ocol += DIM) {
+              const int I = ocols - ocol > DIM ? DIM : ocols - ocol;
+
+              for (int och = 0; och < ochs; och += DIM) {
+                const int J = ochs - och > DIM ? DIM : ochs - och;
+
+                const uint32_t C_sp_addr =
+                    C_sp_addr_start + (och / DIM) * batches * orows * ocols +
+                    b * orows * ocols + orow * ocols + ocol;
+
+                elem_t *out = output +
+                              (b * out_row_dim * out_col_dim +
+                               orow * out_col_dim + ocol) *
+                                  out_stride +
+                              och;
+                if (trans_output_1203) {
+                  out = output +
+                        (orow * out_col_dim * batch_size + ocol * batch_size +
+                         b) *
+                            out_channels +
+                        och;
+                }
+
+                gemmini_extended_mvout(out, C_sp_addr, J, I);
+              }
+            }
+      } else {
+        printf("Pooling with rectangular convolutions is currently not supported.\n");
+        exit(1);
+      }
+    }
+    */
   }
 
   void tiledConv(int batchSize, int inDim, int inChannels, int outChannels,
@@ -1078,7 +1457,7 @@ class GemminiTileConvOpLowering : public ConvertOpToLLVMPattern<TileConvOp> {
         loc, rewriter.getI64Type(), strideAttr);
     rewriter.create<ConfigStOp>(loc, strideValue, act, llvm::APFloat(scale));
     rewriter.create<ConfigExOp>(
-        loc, /*dataflow = */ 1, /*act = */ 0, /*shift = */ 0,
+        loc, /*dataflow = */ WEIGHT_STATIONARY, /*act = */ 0, /*shift = */ 0,
         /*scale = */ llvm::APFloat((float)0), /*cStride = */ inputDilation,
         /*aStride = */ stride >> downsample,
         /*aTranspose = */ transInput3120, /*bTranspose*/ transWeight0132,
