@@ -675,7 +675,7 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
     const size_t sizeofC = fullC ? sizeof(acc_t) : sizeof(elem_t);
     Location loc = tileMatMulOp.getLoc();
     llvm::APFloat accScaleIdentity((float)ACC_SCALE_IDENTITY);
-    rewriter.create<ConfigExOp>(loc, /*dataflow = */ 1, /*sysAct = */ act & 3,
+    rewriter.create<ConfigExOp>(loc, /*dataflow = */ dataflow, /*sysAct = */ act & 3,
                                 /* sysShift = */ 0, accScaleIdentity);
     Value strideValue = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getI64IntegerAttr(strideC * sizeofC));
