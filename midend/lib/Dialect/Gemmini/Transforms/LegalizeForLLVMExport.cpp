@@ -257,6 +257,60 @@ struct GemminiMvinOpLowering : public ConvertOpToLLVMPattern<MvinOp> {
   }
 };
 
+struct GemminiMvin2OpLowering : public ConvertOpToLLVMPattern<Mvin2Op> {
+  using ConvertOpToLLVMPattern<Mvin2Op>::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(Mvin2Op mvin2Op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Value input = mvin2Op.getInput();
+    Location loc = input.getLoc();
+    MemRefType memRefType =
+        mvin2Op.getOperandTypes().front().dyn_cast<MemRefType>();
+    llvm::ArrayRef<int64_t> memRefShape = memRefType.getShape();
+    TypeRange resultType = mlir::TypeRange(rewriter.getIndexType());
+    Value extractOp = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
+        loc, resultType, input);
+    IntegerType i64Type = rewriter.getI64Type();
+    Value indexCastOp =
+        rewriter.create<arith::IndexCastOp>(loc, i64Type, extractOp);
+    Value spadAddrValue = mvin2Op.getAddr();
+    uint64_t number = getNumberFromValue(spadAddrValue);
+    uint64_t spadAddrInt = (uint64_t)memRefShape[0] << (ADDR_LEN + 16) |
+                           (uint64_t)memRefShape[1] << ADDR_LEN | number;
+    Value spad = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI64IntegerAttr(spadAddrInt));
+    rewriter.replaceOpWithNewOp<Mvin2_IntrOp>(mvin2Op, indexCastOp, spad);
+    return success();
+  }
+};
+
+struct GemminiMvin3OpLowering : public ConvertOpToLLVMPattern<Mvin3Op> {
+  using ConvertOpToLLVMPattern<Mvin3Op>::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(Mvin3Op mvin3Op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Value input = mvin3Op.getInput();
+    Location loc = input.getLoc();
+    MemRefType memRefType =
+        mvin3Op.getOperandTypes().front().dyn_cast<MemRefType>();
+    llvm::ArrayRef<int64_t> memRefShape = memRefType.getShape();
+    TypeRange resultType = mlir::TypeRange(rewriter.getIndexType());
+    Value extractOp = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
+        loc, resultType, input);
+    IntegerType i64Type = rewriter.getI64Type();
+    Value indexCastOp =
+        rewriter.create<arith::IndexCastOp>(loc, i64Type, extractOp);
+    Value spadAddrValue = mvin3Op.getAddr();
+    uint64_t number = getNumberFromValue(spadAddrValue);
+    uint64_t spadAddrInt = (uint64_t)memRefShape[0] << (ADDR_LEN + 16) |
+                           (uint64_t)memRefShape[1] << ADDR_LEN | number;
+    Value spad = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI64IntegerAttr(spadAddrInt));
+    rewriter.replaceOpWithNewOp<Mvin3_IntrOp>(mvin3Op, indexCastOp, spad);
+    return success();
+  }
+};
+
 struct GemminiMvoutLowering : public ConvertOpToLLVMPattern<MvoutOp> {
   using ConvertOpToLLVMPattern<MvoutOp>::ConvertOpToLLVMPattern;
   LogicalResult
